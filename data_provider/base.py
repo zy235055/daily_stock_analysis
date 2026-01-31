@@ -18,7 +18,7 @@ import logging
 import random
 import time
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional, List, Tuple, Dict
 
 import pandas as pd
@@ -280,8 +280,20 @@ class DataFetcherManager:
 
         config = get_config()
 
+        if getattr(config, 'tushare_only', False):
+            # Only use Tushare when configured to avoid mixed sources.
+            tushare = TushareFetcher()
+            self._fetchers = [tushare]
+            self._fetchers.sort(key=lambda f: f.priority)
+            priority_info = ", ".join([f"{f.name}(P{f.priority})" for f in self._fetchers])
+            logger.info(f"已初始化 {len(self._fetchers)} 个数据源（Tushare Only）: {priority_info}")
+            return
+
         # 创建所有数据源实例（优先级在各 Fetcher 的 __init__ 中确定）
-        efinance = EfinanceFetcher()
+        use_efinance = not bool(config.tushare_token)
+        if not use_efinance:
+            logger.info("检测到 TUSHARE_TOKEN，默认禁用 EfinanceFetcher 以避免混用")
+        efinance = EfinanceFetcher() if use_efinance else None
         akshare = AkshareFetcher()
         tushare = TushareFetcher()  # 会根据 Token 配置自动调整优先级
         pytdx = PytdxFetcher()      # 通达信数据源
@@ -290,12 +302,14 @@ class DataFetcherManager:
 
         # 初始化数据源列表
         self._fetchers = [
-            efinance,
-            akshare,
-            tushare,
-            pytdx,
-            baostock,
-            yfinance,
+            f for f in [
+                efinance,
+                akshare,
+                tushare,
+                pytdx,
+                baostock,
+                yfinance,
+            ] if f is not None
         ]
 
         # 按优先级排序（Tushare 如果配置了 Token 且初始化成功，优先级为 0）
@@ -304,6 +318,24 @@ class DataFetcherManager:
         # 构建优先级说明
         priority_info = ", ".join([f"{f.name}(P{f.priority})" for f in self._fetchers])
         logger.info(f"已初始化 {len(self._fetchers)} 个数据源（按优先级）: {priority_info}")
+
+    def get_trade_status(self) -> Tuple[date, bool]:
+        """
+        获取最新交易日与是否为交易日（优先使用 Tushare）。
+
+        Returns:
+            (latest_trade_date, is_trade_day_today)
+        """
+        today = datetime.now().date()
+        for fetcher in self._fetchers:
+            if fetcher.name == "TushareFetcher" and hasattr(fetcher, "get_trade_status"):
+                try:
+                    return fetcher.get_trade_status()
+                except Exception as e:
+                    logger.warning(f"[交易日历] Tushare 获取失败: {e}")
+                    break
+        # Fallback: assume today is trade day when no calendar available.
+        return today, True
     
     def add_fetcher(self, fetcher: BaseFetcher) -> None:
         """添加数据源并重新排序"""
@@ -552,6 +584,11 @@ class DataFetcherManager:
         from src.config import get_config
         
         config = get_config()
+
+        chip_source = getattr(config, "chip_source", "akshare")
+        if chip_source == "none":
+            logger.debug(f"[筹码分布] 已配置为 none，跳过 {stock_code}")
+            return None
         
         # 如果筹码分布功能被禁用，直接返回 None
         if not config.enable_chip_distribution:
@@ -565,15 +602,24 @@ class DataFetcherManager:
             return None
         
         try:
-            # 调用 AkshareFetcher 获取筹码分布
-            for fetcher in self._fetchers:
-                if fetcher.name == "AkshareFetcher":
-                    if hasattr(fetcher, 'get_chip_distribution'):
+            if chip_source == "akshare":
+                # 调用 AkshareFetcher 获取筹码分布
+                for fetcher in self._fetchers:
+                    if fetcher.name == "AkshareFetcher":
+                        if hasattr(fetcher, 'get_chip_distribution'):
+                            chip = fetcher.get_chip_distribution(stock_code)
+                            if chip is not None:
+                                circuit_breaker.record_success("akshare_chip")
+                                return chip
+                        break
+            elif chip_source == "tushare":
+                for fetcher in self._fetchers:
+                    if fetcher.name == "TushareFetcher" and hasattr(fetcher, 'get_chip_distribution'):
                         chip = fetcher.get_chip_distribution(stock_code)
                         if chip is not None:
-                            circuit_breaker.record_success("akshare_chip")
                             return chip
-                    break
+                        break
+                logger.warning("[筹码分布] Tushare 筹码接口未实现或无权限，返回空")
             
             return None
             

@@ -16,7 +16,7 @@ TushareFetcher - 备用数据源 1 (Priority 2)
 
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, date
 from typing import Optional, Tuple
 
 import pandas as pd
@@ -65,6 +65,7 @@ class TushareFetcher(BaseFetcher):
         self._call_count = 0  # 当前分钟内的调用次数
         self._minute_start: Optional[float] = None  # 当前计数周期开始时间
         self._api: Optional[object] = None  # Tushare API 实例
+        self._trade_cal_cache: Optional[dict] = None
 
         # 尝试初始化 API
         self._init_api()
@@ -243,7 +244,25 @@ class TushareFetcher(BaseFetcher):
                 start_date=ts_start,
                 end_date=ts_end,
             )
-            
+            # 调用 daily_basic 接口补充换手率/量比/估值等（可配置）
+            basic_df = None
+            config = get_config()
+            if config.daily_basic_source == "tushare":
+                try:
+                    basic_df = self._fetch_daily_basic(ts_code, ts_start, ts_end)
+                except Exception as e:
+                    logger.warning(f"Tushare daily_basic 获取失败: {e}")
+
+            if basic_df is not None and not basic_df.empty:
+                # 避免与技术指标 volume_ratio 冲突
+                basic_df = basic_df.rename(columns={'volume_ratio': 'volume_ratio_basic'})
+                basic_df['basic_fetched'] = True
+                df = df.merge(basic_df, on=['ts_code', 'trade_date'], how='left')
+                # daily_basic 成功时，仅匹配到的记录标记为已获取
+                df['basic_fetched'] = df['basic_fetched'].fillna(False)
+            else:
+                df['basic_fetched'] = False
+
             return df
             
         except Exception as e:
@@ -255,6 +274,22 @@ class TushareFetcher(BaseFetcher):
                 raise RateLimitError(f"Tushare 配额超限: {e}") from e
             
             raise DataFetchError(f"Tushare 获取数据失败: {e}") from e
+
+    def _fetch_daily_basic(self, ts_code: str, start_date: str, end_date: str) -> pd.DataFrame:
+        """
+        获取 daily_basic 补充字段（换手率/量比/估值等）
+        """
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化，请检查 Token 配置")
+
+        self._check_rate_limit()
+
+        return self._api.daily_basic(
+            ts_code=ts_code,
+            start_date=start_date,
+            end_date=end_date,
+            fields="ts_code,trade_date,turnover_rate,volume_ratio,pe,pb,total_mv,circ_mv",
+        )
     
     def _normalize_data(self, df: pd.DataFrame, stock_code: str) -> pd.DataFrame:
         """
@@ -288,16 +323,80 @@ class TushareFetcher(BaseFetcher):
         # 成交额单位转换（Tushare 的 amount 单位是千元，转换为元）
         if 'amount' in df.columns:
             df['amount'] = df['amount'] * 1000
+
+        # daily_basic 字段数值转换
+        basic_cols = ['turnover_rate', 'volume_ratio_basic', 'pe', 'pb', 'total_mv', 'circ_mv']
+        for col in basic_cols:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
         
         # 添加股票代码列
         df['code'] = stock_code
         
         # 只保留需要的列
-        keep_cols = ['code'] + STANDARD_COLUMNS
+        keep_cols = ['code'] + STANDARD_COLUMNS + [
+            'turnover_rate',
+            'volume_ratio_basic',
+            'pe',
+            'pb',
+            'total_mv',
+            'circ_mv',
+            'basic_fetched',
+        ]
         existing_cols = [col for col in keep_cols if col in df.columns]
         df = df[existing_cols]
         
         return df
+
+    def get_trade_status(self) -> Tuple[date, bool]:
+        """
+        获取最新交易日及今日是否为交易日。
+
+        Returns:
+            (latest_trade_date, is_trade_day_today)
+        """
+        if self._api is None:
+            raise DataFetchError("Tushare API 未初始化，无法获取交易日历")
+
+        today = datetime.now().date()
+        cache = self._trade_cal_cache
+        if cache and cache.get("asof") == today:
+            return cache["latest_trade_date"], cache["is_trade_day_today"]
+
+        # 最近一段时间交易日历足够判断最新交易日
+        start = (today - pd.Timedelta(days=60)).strftime("%Y%m%d")
+        end = today.strftime("%Y%m%d")
+
+        self._check_rate_limit()
+        df = self._api.trade_cal(
+            exchange="",
+            start_date=start,
+            end_date=end,
+            fields="cal_date,is_open",
+        )
+
+        open_dates = []
+        if df is not None and not df.empty:
+            open_df = df[df["is_open"] == 1]
+            for d in open_df["cal_date"].tolist():
+                try:
+                    open_dates.append(datetime.strptime(d, "%Y%m%d").date())
+                except Exception:
+                    continue
+
+        if not open_dates:
+            latest_trade_date = today
+            is_trade_day_today = True
+        else:
+            latest_trade_date = max([d for d in open_dates if d <= today])
+            is_trade_day_today = today in open_dates
+
+        self._trade_cal_cache = {
+            "asof": today,
+            "latest_trade_date": latest_trade_date,
+            "is_trade_day_today": is_trade_day_today,
+        }
+        return latest_trade_date, is_trade_day_today
 
     def get_stock_name(self, stock_code: str) -> Optional[str]:
         """

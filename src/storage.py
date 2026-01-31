@@ -83,6 +83,13 @@ class StockDaily(Base):
     ma10 = Column(Float)
     ma20 = Column(Float)
     volume_ratio = Column(Float)  # 量比
+    volume_ratio_basic = Column(Float)  # Tushare daily_basic 量比
+    turnover_rate = Column(Float)  # 换手率
+    pe = Column(Float)  # 市盈率
+    pb = Column(Float)  # 市净率
+    total_mv = Column(Float)  # 总市值
+    circ_mv = Column(Float)  # 流通市值
+    basic_fetched = Column(Integer, default=0)  # daily_basic 是否已获取
     
     # 数据来源
     data_source = Column(String(50))  # 记录数据来源（如 AkshareFetcher）
@@ -116,6 +123,13 @@ class StockDaily(Base):
             'ma10': self.ma10,
             'ma20': self.ma20,
             'volume_ratio': self.volume_ratio,
+            'volume_ratio_basic': self.volume_ratio_basic,
+            'turnover_rate': self.turnover_rate,
+            'pe': self.pe,
+            'pb': self.pb,
+            'total_mv': self.total_mv,
+            'circ_mv': self.circ_mv,
+            'basic_fetched': bool(self.basic_fetched),
             'data_source': self.data_source,
         }
 
@@ -169,12 +183,31 @@ class DatabaseManager:
         
         # 创建所有表
         Base.metadata.create_all(self._engine)
+        self._migrate_stock_daily_schema()
 
         self._initialized = True
         logger.info(f"数据库初始化完成: {db_url}")
 
         # 注册退出钩子，确保程序退出时关闭数据库连接
         atexit.register(DatabaseManager._cleanup_engine, self._engine)
+
+    def _migrate_stock_daily_schema(self) -> None:
+        """为 stock_daily 表添加缺失列（轻量迁移）"""
+        required_columns = {
+            "volume_ratio_basic": "FLOAT",
+            "turnover_rate": "FLOAT",
+            "pe": "FLOAT",
+            "pb": "FLOAT",
+            "total_mv": "FLOAT",
+            "circ_mv": "FLOAT",
+            "basic_fetched": "INTEGER",
+        }
+        with self._engine.connect() as conn:
+            result = conn.exec_driver_sql("PRAGMA table_info(stock_daily)")
+            existing_cols = {row[1] for row in result.fetchall()}
+            for col, col_type in required_columns.items():
+                if col not in existing_cols:
+                    conn.exec_driver_sql(f"ALTER TABLE stock_daily ADD COLUMN {col} {col_type}")
     
     @classmethod
     def get_instance(cls) -> 'DatabaseManager':
@@ -372,6 +405,28 @@ class DatabaseManager:
                         existing.ma10 = row.get('ma10')
                         existing.ma20 = row.get('ma20')
                         existing.volume_ratio = row.get('volume_ratio')
+                        # daily_basic 补充字段（仅在有值时更新）
+                        val = row.get('volume_ratio_basic')
+                        if val is not None and pd.notna(val):
+                            existing.volume_ratio_basic = val
+                        val = row.get('turnover_rate')
+                        if val is not None and pd.notna(val):
+                            existing.turnover_rate = val
+                        val = row.get('pe')
+                        if val is not None and pd.notna(val):
+                            existing.pe = val
+                        val = row.get('pb')
+                        if val is not None and pd.notna(val):
+                            existing.pb = val
+                        val = row.get('total_mv')
+                        if val is not None and pd.notna(val):
+                            existing.total_mv = val
+                        val = row.get('circ_mv')
+                        if val is not None and pd.notna(val):
+                            existing.circ_mv = val
+                        val = row.get('basic_fetched')
+                        if val is not None and pd.notna(val):
+                            existing.basic_fetched = int(bool(val))
                         existing.data_source = data_source
                         existing.updated_at = datetime.now()
                     else:
@@ -390,6 +445,13 @@ class DatabaseManager:
                             ma10=row.get('ma10'),
                             ma20=row.get('ma20'),
                             volume_ratio=row.get('volume_ratio'),
+                            volume_ratio_basic=None if pd.isna(row.get('volume_ratio_basic')) else row.get('volume_ratio_basic'),
+                            turnover_rate=None if pd.isna(row.get('turnover_rate')) else row.get('turnover_rate'),
+                            pe=None if pd.isna(row.get('pe')) else row.get('pe'),
+                            pb=None if pd.isna(row.get('pb')) else row.get('pb'),
+                            total_mv=None if pd.isna(row.get('total_mv')) else row.get('total_mv'),
+                            circ_mv=None if pd.isna(row.get('circ_mv')) else row.get('circ_mv'),
+                            basic_fetched=int(bool(row.get('basic_fetched'))) if row.get('basic_fetched') is not None and pd.notna(row.get('basic_fetched')) else 0,
                             data_source=data_source,
                         )
                         session.add(record)
@@ -404,6 +466,41 @@ class DatabaseManager:
                 raise
         
         return saved_count
+
+    def has_data_for_date(
+        self,
+        code: str,
+        target_date: date,
+        require_basic: bool = False,
+    ) -> bool:
+        """
+        判断指定日期是否已有数据（可选要求 daily_basic 已获取）。
+        """
+        with self.get_session() as session:
+            stmt = select(StockDaily).where(
+                and_(
+                    StockDaily.code == code,
+                    StockDaily.date == target_date,
+                )
+            )
+            record = session.execute(stmt).scalars().first()
+            if not record:
+                return False
+            if not require_basic:
+                return True
+            # 优先使用 basic_fetched 标记
+            if getattr(record, "basic_fetched", None):
+                return True
+            # 兜底：任一 daily_basic 字段存在即认为已获取
+            basic_fields = [
+                "turnover_rate",
+                "volume_ratio_basic",
+                "pe",
+                "pb",
+                "total_mv",
+                "circ_mv",
+            ]
+            return any(getattr(record, f, None) is not None for f in basic_fields)
     
     def get_analysis_context(
         self, 

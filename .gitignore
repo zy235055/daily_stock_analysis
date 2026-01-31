@@ -67,3 +67,5 @@ local/
 run.sh
 
 verify_*.py
+%TEMP%Miniconda3-latest-Windows-x86_64.exe
+nul

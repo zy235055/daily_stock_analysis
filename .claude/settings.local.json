@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(conda:*)",
+      "Bash(where:*)",
+      "Bash(curl:*)",
+      "Bash(%TEMP%\\\\Miniconda3-latest-Windows-x86_64.exe:*)",
+      "Bash(cmd //c:*)",
+      "Bash(dir:*)",
+      "Bash(powershell -Command:*)"
+    ]
+  }
+}

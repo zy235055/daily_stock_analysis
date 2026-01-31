@@ -38,7 +38,10 @@ class Config:
 
     # === 数据源 API Token ===
     tushare_token: Optional[str] = None
-    
+    tushare_only: bool = False
+    daily_basic_source: str = "tushare"
+    chip_source: str = "akshare"
+
     # === AI 分析配置 ===
     gemini_api_key: Optional[str] = None
     gemini_model: str = "gemini-3-flash-preview"  # 主模型
@@ -301,6 +304,9 @@ class Config:
             feishu_app_secret=os.getenv('FEISHU_APP_SECRET'),
             feishu_folder_token=os.getenv('FEISHU_FOLDER_TOKEN'),
             tushare_token=os.getenv('TUSHARE_TOKEN'),
+            tushare_only=os.getenv('TUSHARE_ONLY', 'false').lower() == 'true',
+            daily_basic_source=os.getenv('DAILY_BASIC_SOURCE', 'tushare').lower(),
+            chip_source=os.getenv('CHIP_SOURCE', 'akshare').lower(),
             gemini_api_key=os.getenv('GEMINI_API_KEY'),
             gemini_model=os.getenv('GEMINI_MODEL', 'gemini-3-flash-preview'),
             gemini_model_fallback=os.getenv('GEMINI_MODEL_FALLBACK', 'gemini-2.5-flash'),
@@ -431,6 +437,16 @@ class Config:
         
         if not self.tushare_token:
             warnings.append("提示：未配置 Tushare Token，将使用其他数据源")
+            if self.tushare_only:
+                warnings.append("警告：Tushare Only 模式已开启但未配置 Token，数据获取将失败")
+        elif self.tushare_only:
+            warnings.append("提示：已启用 Tushare Only 模式，个股数据将仅使用 Tushare")
+        if self.daily_basic_source not in ("tushare", "none"):
+            warnings.append("提示：DAILY_BASIC_SOURCE 非法，已回退为 tushare")
+            self.daily_basic_source = "tushare"
+        if self.chip_source not in ("akshare", "tushare", "none"):
+            warnings.append("提示：CHIP_SOURCE 非法，已回退为 akshare")
+            self.chip_source = "akshare"
         
         if not self.gemini_api_key and not self.openai_api_key:
             warnings.append("警告：未配置 Gemini 或 OpenAI API Key，AI 分析功能将不可用")

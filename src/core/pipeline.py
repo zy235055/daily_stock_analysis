@@ -14,13 +14,13 @@ A股自选股智能分析系统 - 核心分析流水线
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import date
+from datetime import date, datetime
 from typing import List, Dict, Any, Optional, Tuple
 
 from src.config import get_config, Config
 from src.storage import get_db
 from data_provider import DataFetcherManager
-from data_provider.realtime_types import ChipDistribution
+from data_provider.realtime_types import ChipDistribution, UnifiedRealtimeQuote, RealtimeSource
 from src.analyzer import GeminiAnalyzer, AnalysisResult, STOCK_NAME_MAP
 from src.notification import NotificationService, NotificationChannel
 from src.search_service import SearchService
@@ -66,6 +66,7 @@ class StockAnalysisPipeline:
         self.trend_analyzer = StockTrendAnalyzer()  # 趋势分析器
         self.analyzer = GeminiAnalyzer()
         self.notifier = NotificationService(source_message=source_message)
+        self._trade_status_cache: Optional[Tuple[date, bool]] = None
         
         # 初始化搜索服务
         self.search_service = SearchService(
@@ -112,11 +113,26 @@ class StockAnalysisPipeline:
         """
         try:
             today = date.today()
-            
+
+            # Tushare-only: 使用交易日历判断是否需要更新
+            if not force_refresh and bool(self.config.tushare_token):
+                latest_trade_date, is_trade_day_today = self._get_trade_status_cached()
+                require_basic = getattr(self.config, "daily_basic_source", "tushare") == "tushare"
+                if self.db.has_data_for_date(code, latest_trade_date, require_basic=require_basic):
+                    logger.info(f"[{code}] 最新交易日数据已存在，跳过获取")
+                    return True, None
+
+                # 如果最新交易日是今天，且尚未到收盘后时段，则跳过
+                if latest_trade_date == today and is_trade_day_today:
+                    if datetime.now().time() < datetime.strptime("16:30", "%H:%M").time():
+                        logger.info(f"[{code}] 今日尚未收盘，跳过日线获取")
+                        return True, None
+
             # 断点续传检查：如果今日数据已存在，跳过
-            if not force_refresh and self.db.has_today_data(code, today):
-                logger.info(f"[{code}] 今日数据已存在，跳过获取（断点续传）")
-                return True, None
+            if not force_refresh and not getattr(self.config, "tushare_only", False):
+                if self.db.has_today_data(code, today):
+                    logger.info(f"[{code}] 今日数据已存在，跳过获取（断点续传）")
+                    return True, None
             
             # 从数据源获取数据
             logger.info(f"[{code}] 开始从数据源获取数据...")
@@ -135,6 +151,11 @@ class StockAnalysisPipeline:
             error_msg = f"获取/保存数据失败: {str(e)}"
             logger.error(f"[{code}] {error_msg}")
             return False, error_msg
+
+    def _get_trade_status_cached(self) -> Tuple[date, bool]:
+        if self._trade_status_cache is None:
+            self._trade_status_cache = self.fetcher_manager.get_trade_status()
+        return self._trade_status_cache
     
     def analyze_stock(self, code: str) -> Optional[AnalysisResult]:
         """
@@ -160,22 +181,35 @@ class StockAnalysisPipeline:
             
             # Step 1: 获取实时行情（量比、换手率等）- 使用统一入口，自动故障切换
             realtime_quote = None
-            try:
-                realtime_quote = self.fetcher_manager.get_realtime_quote(code)
-                if realtime_quote:
-                    # 使用实时行情返回的真实股票名称
-                    if realtime_quote.name:
-                        stock_name = realtime_quote.name
-                    # 兼容不同数据源的字段（有些数据源可能没有 volume_ratio）
-                    volume_ratio = getattr(realtime_quote, 'volume_ratio', None)
-                    turnover_rate = getattr(realtime_quote, 'turnover_rate', None)
-                    logger.info(f"[{code}] {stock_name} 实时行情: 价格={realtime_quote.price}, "
-                              f"量比={volume_ratio}, 换手率={turnover_rate}% "
-                              f"(来源: {realtime_quote.source.value if hasattr(realtime_quote, 'source') else 'unknown'})")
-                else:
-                    logger.info(f"[{code}] 实时行情获取失败或已禁用，将使用历史数据进行分析")
-            except Exception as e:
-                logger.warning(f"[{code}] 获取实时行情失败: {e}")
+            if not self.config.enable_realtime_quote:
+                logger.info(f"[{code}] 实时行情已禁用，将使用历史数据进行分析")
+            else:
+                try:
+                    realtime_quote = self.fetcher_manager.get_realtime_quote(code)
+                    if realtime_quote:
+                        # 使用实时行情返回的真实股票名称
+                        if realtime_quote.name:
+                            stock_name = realtime_quote.name
+                        # 兼容不同数据源的字段（有些数据源可能没有 volume_ratio）
+                        volume_ratio = getattr(realtime_quote, 'volume_ratio', None)
+                        turnover_rate = getattr(realtime_quote, 'turnover_rate', None)
+                        logger.info(f"[{code}] {stock_name} 实时行情: 价格={realtime_quote.price}, "
+                                  f"量比={volume_ratio}, 换手率={turnover_rate}% "
+                                  f"(来源: {realtime_quote.source.value if hasattr(realtime_quote, 'source') else 'unknown'})")
+                    else:
+                        logger.info(f"[{code}] 实时行情获取失败或已禁用，将使用历史数据进行分析")
+                except Exception as e:
+                    logger.warning(f"[{code}] 获取实时行情失败: {e}")
+
+            # 若仍未获得股票名称，尝试通过数据源查询（Tushare Only 时仅用 Tushare）
+            if not stock_name or stock_name.startswith('股票'):
+                try:
+                    fetched_name = self.fetcher_manager.get_stock_name(code)
+                    if fetched_name:
+                        stock_name = fetched_name
+                        logger.info(f"[{code}] 股票名称已从数据源获取: {stock_name}")
+                except Exception as e:
+                    logger.debug(f"[{code}] 获取股票名称失败: {e}")
             
             # 如果还是没有名称，使用代码作为名称
             if not stock_name:
@@ -234,6 +268,10 @@ class StockAnalysisPipeline:
             
             # Step 5: 获取分析上下文（技术面数据）
             context = self.db.get_analysis_context(code)
+            if context and context.get('today'):
+                basic_fetched = context['today'].get('basic_fetched')
+                if basic_fetched is not None:
+                    logger.info(f"[{code}] daily_basic 已入库: {bool(basic_fetched)}")
             
             if context is None:
                 logger.warning(f"[{code}] 无法获取历史行情数据，将仅基于新闻和实时行情分析")
@@ -247,7 +285,35 @@ class StockAnalysisPipeline:
                     'yesterday': {}
                 }
             
-            # Step 6: 增强上下文数据（添加实时行情、筹码、趋势分析结果、股票名称）
+            # Step 6: 如果未启用实时行情且为 Tushare Only，使用 daily_basic 作为实时替代
+            if realtime_quote is None and getattr(self.config, "daily_basic_source", "tushare") == "tushare":
+                today_ctx = context.get('today', {}) if context else {}
+                basic_volume_ratio = today_ctx.get('volume_ratio_basic')
+                fallback_volume_ratio = basic_volume_ratio if basic_volume_ratio is not None else today_ctx.get('volume_ratio')
+                if any(
+                    v is not None for v in [
+                        fallback_volume_ratio,
+                        today_ctx.get('turnover_rate'),
+                        today_ctx.get('pe'),
+                        today_ctx.get('pb'),
+                        today_ctx.get('total_mv'),
+                        today_ctx.get('circ_mv'),
+                    ]
+                ):
+                    realtime_quote = UnifiedRealtimeQuote(
+                        code=code,
+                        name=stock_name,
+                        source=RealtimeSource.FALLBACK,
+                        price=today_ctx.get('close'),
+                        volume_ratio=fallback_volume_ratio,
+                        turnover_rate=today_ctx.get('turnover_rate'),
+                        pe_ratio=today_ctx.get('pe'),
+                        pb_ratio=today_ctx.get('pb'),
+                        total_mv=today_ctx.get('total_mv'),
+                        circ_mv=today_ctx.get('circ_mv'),
+                    )
+
+            # Step 7: 增强上下文数据（添加实时行情、筹码、趋势分析结果、股票名称）
             enhanced_context = self._enhance_context(
                 context, 
                 realtime_quote, 
@@ -256,8 +322,15 @@ class StockAnalysisPipeline:
                 stock_name  # 传入股票名称
             )
             
-            # Step 7: 调用 AI 分析（传入增强的上下文和新闻）
+            # Step 8: 调用 AI 分析（传入增强的上下文和新闻）
             result = self.analyzer.analyze(enhanced_context, news_context=news_context)
+            if result and getattr(self.config, "daily_basic_source", "tushare") == "tushare":
+                basic_flag = None
+                if context and context.get('today'):
+                    basic_flag = context['today'].get('basic_fetched')
+                basic_text = f"daily_basic={bool(basic_flag)}" if basic_flag is not None else "daily_basic=unknown"
+                source_text = f"Tushare daily+daily_basic ({basic_text})"
+                result.data_sources = source_text if not result.data_sources else f"{result.data_sources} | {source_text}"
             
             return result
             
